@@ -310,16 +310,18 @@ func pruneTMData(home string) error {
 	defer stateStore.Close()
 
 	base := blockStore.Base()
+	currentHeight := blockStore.Height()
 
-	pruneHeight := blockStore.Height() - int64(blocks)
-	logger.Debug("pruneHeight=%d", pruneHeight)
+	pruneHeight := currentHeight - int64(blocks)
+	logger.Debug("pruneHeight=%d, currentHeight=%d", pruneHeight, currentHeight)
+
 	if pruneHeight <= 0 {
 		logger.Info("No need to prune tendermint data")
 		return nil
 	}
 
 	if txIdxHeight <= 0 {
-		txIdxHeight = blockStore.Height()
+		txIdxHeight = currentHeight
 		logger.Debug("set txIdxHeight=%d", txIdxHeight)
 	}
 
@@ -347,25 +349,36 @@ func pruneTMData(home string) error {
 		}
 	}
 
-	// CRITICAL: Skip state store pruning to avoid corruption
-	logger.Warn("Skipping state store pruning due to consensus data corruption risk")
-	logger.Info("State store contains critical validator and consensus data needed for node operation")
-	logger.Info("Consider using node's built-in pruning options instead for state data")
-
-	// DISABLED STATE STORE PRUNING - Too dangerous
-	/*
+	// CONSERVATIVE STATE STORE PRUNING
 	logger.Info("pruning state store")
-	// prune state store
-	// prune in batches to avoid memory issues and maintain performance with LevelDB
-	for pruneStateFrom := base; pruneStateFrom < pruneHeight-1; pruneStateFrom += rootmulti.PRUNE_BATCH_SIZE {
-		endHeight := pruneStateFrom + rootmulti.PRUNE_BATCH_SIZE
-		if endHeight >= pruneHeight-1 {
-			endHeight = pruneHeight - 1
+
+	// Safety check: only prune if we have a very large safety buffer
+	statePruneHeight := currentHeight - int64(blocks) - 10000  // Extra 10k block safety buffer
+	if statePruneHeight <= base {
+		logger.Info("Skipping state store pruning - insufficient safety buffer")
+		logger.Info("Need at least %d blocks beyond retention for safe state pruning", 10000)
+		logger.Info("Current height: %d, retention: %d blocks, base: %d", currentHeight, blocks, base)
+		return nil
+	}
+
+	logger.Info("State store pruning with safety buffer: pruning up to height %d", statePruneHeight)
+	logger.Info("Keeping %d blocks + 10k safety buffer beyond current height %d", blocks, currentHeight)
+
+	// Conservative pruning: smaller batches, larger safety margin
+	conservativeBatchSize := int64(100) // Much smaller batches
+
+	for pruneStateFrom := base; pruneStateFrom < statePruneHeight; pruneStateFrom += conservativeBatchSize {
+		endHeight := pruneStateFrom + conservativeBatchSize
+		if endHeight > statePruneHeight {
+			endHeight = statePruneHeight
 		}
+
+		logger.Debug("Pruning state from %d to %d", pruneStateFrom, endHeight)
 		err = stateStore.PruneStates(pruneStateFrom, endHeight)
 		if err != nil {
-			//return err
 			logger.Error("Failed to prune states from %d to %d: %v", pruneStateFrom, endHeight, err)
+			logger.Warn("Stopping state store pruning due to error to prevent corruption")
+			break
 		}
 	}
 
@@ -375,7 +388,6 @@ func pruneTMData(home string) error {
 			logger.Error("Failed to compact state store: %v", err)
 		}
 	}
-	*/
 
 	return nil
 }
