@@ -243,11 +243,6 @@ func pruneAppState(home string) error {
 	// TODO: cleanup app state
 	appStore := rootmulti.NewStore(appDB)
 
-	if txIdxHeight <= 0 {
-		txIdxHeight = appStore.LastCommitID().Version
-		logger.Debug("set txIdxHeight=%d", txIdxHeight)
-	}
-
 	for _, value := range keys {
 		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
 	}
@@ -256,6 +251,15 @@ func pruneAppState(home string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load latest version: %w", err)
 	}
+
+	// Use the application store's actual latest version for tx_index height
+	if txIdxHeight <= 0 {
+		txIdxHeight = appStore.LastCommitID().Version
+		logger.Debug("set txIdxHeight=%d from application store", txIdxHeight)
+	}
+
+	appLatestVersion := appStore.LastCommitID().Version
+	logger.Debug("application store latest version: %d", appLatestVersion)
 
 	allVersions := appStore.GetAllVersions()
 
