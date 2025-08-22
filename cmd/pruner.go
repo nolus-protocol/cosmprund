@@ -347,6 +347,13 @@ func pruneTMData(home string) error {
 		}
 	}
 
+	// CRITICAL: Skip state store pruning to avoid corruption
+	logger.Warn("Skipping state store pruning due to consensus data corruption risk")
+	logger.Info("State store contains critical validator and consensus data needed for node operation")
+	logger.Info("Consider using node's built-in pruning options instead for state data")
+
+	// DISABLED STATE STORE PRUNING - Too dangerous
+	/*
 	logger.Info("pruning state store")
 	// prune state store
 	// prune in batches to avoid memory issues and maintain performance with LevelDB
@@ -368,6 +375,7 @@ func pruneTMData(home string) error {
 			logger.Error("Failed to compact state store: %v", err)
 		}
 	}
+	*/
 
 	return nil
 }
