@@ -223,22 +223,7 @@ func pruneAppState(home string) error {
 
 	var err error
 
-	//TODO: need to get all versions in the store, setting randomly is too slow
 	logger.Info("pruning application state")
-
-	//// only mount keys from core sdk
-	//// todo allow for other keys to be mounted
-	//keys := types.NewKVStoreKeys(
-	//	authtypes.StoreKey, banktypes.StoreKey, stakingtypes.StoreKey,
-	//	minttypes.StoreKey, distrtypes.StoreKey, slashingtypes.StoreKey,
-	//	govtypes.StoreKey, paramstypes.StoreKey, ibchost.StoreKey, upgradetypes.StoreKey,
-	//	evidencetypes.StoreKey, ibctransfertypes.StoreKey, capabilitytypes.StoreKey,
-	//)
-
-	if app == "osmosis" {
-		logger.Warn("osmosis AppState not supported, skipping")
-		return nil
-	}
 
 	keys := getStoreKeys(appDB)
 
@@ -324,8 +309,7 @@ func pruneTMData(home string) error {
 	logger.Info("pruning block store")
 
 	// prune block store
-	// prune one by one instead of range to avoid `panic: pebble: batch too large: >= 4.0 G` issue
-	// (see https://github.com/notional-labs/cosmprund/issues/11)
+	// prune in batches to avoid memory issues and maintain performance with LevelDB
 	for pruneBlockFrom := base; pruneBlockFrom < pruneHeight-1; pruneBlockFrom += rootmulti.PRUNE_BATCH_SIZE {
 		height := pruneBlockFrom
 		if height >= pruneHeight-1 {
@@ -348,8 +332,7 @@ func pruneTMData(home string) error {
 
 	logger.Info("pruning state store")
 	// prune state store
-	// prune one by one instead of range to avoid `panic: pebble: batch too large: >= 4.0 G` issue
-	// (see https://github.com/notional-labs/cosmprund/issues/11)
+	// prune in batches to avoid memory issues and maintain performance with LevelDB
 	for pruneStateFrom := base; pruneStateFrom < pruneHeight-1; pruneStateFrom += rootmulti.PRUNE_BATCH_SIZE {
 		endHeight := pruneStateFrom + rootmulti.PRUNE_BATCH_SIZE
 		if endHeight >= pruneHeight-1 {
