@@ -1,9 +1,9 @@
+// File: cmd/pruner.go
 package cmd
 
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/cockroachdb/pebble"
 	storetypes "github.com/cosmos/cosmos-sdk/store/types"
 	"path/filepath"
 	"strconv"
@@ -38,21 +38,21 @@ func pruneCmd() *cobra.Command {
 			var err error
 			if tendermint {
 				if err = pruneTMData(args[0]); err != nil {
-					fmt.Println(err.Error())
+					logger.Error("Failed to prune tendermint data: %v", err)
 				}
 			}
 
 			if cosmosSdk {
 				err = pruneAppState(args[0])
 				if err != nil {
-					fmt.Println(err.Error())
+					logger.Error("Failed to prune cosmos-sdk data: %v", err)
 				}
 			}
 
 			if tx_idx {
 				err = pruneTxIndex(args[0])
 				if err != nil {
-					fmt.Println(err.Error())
+					logger.Error("Failed to prune tx_index: %v", err)
 				}
 			}
 
@@ -63,7 +63,7 @@ func pruneCmd() *cobra.Command {
 }
 
 func pruneTxIndex(home string) error {
-	fmt.Println("pruning tx_index and block index")
+	logger.Info("pruning tx_index and block index")
 	txIdxDB, err := openDB("tx_index", home)
 	if err != nil {
 		return err
@@ -72,26 +72,26 @@ func pruneTxIndex(home string) error {
 	defer func() {
 		errClose := txIdxDB.Close()
 		if errClose != nil {
-			fmt.Println(errClose.Error())
+			logger.Error("Failed to close tx_index database: %v", errClose)
 		}
 	}()
 
 	pruneHeight := txIdxHeight - int64(blocks) - 10
 	if pruneHeight <= 0 {
-		fmt.Printf("No need to prune (pruneHeight=%d)\n", pruneHeight)
+		logger.Info("No need to prune tx_index (pruneHeight=%d)", pruneHeight)
 		return nil
 	}
 
 	pruneBlockIndex(txIdxDB, pruneHeight)
-	fmt.Println("finished pruning block index")
+	logger.Info("finished pruning block index")
 
 	pruneTxIndexTxs(txIdxDB, pruneHeight)
-	fmt.Println("finished pruning tx_index")
+	logger.Info("finished pruning tx_index")
 
 	if compact {
-		fmt.Println("compacting tx_index")
+		logger.Info("compacting tx_index")
 		if err := compactDB(txIdxDB); err != nil {
-			fmt.Println(err.Error())
+			logger.Error("Failed to compact tx_index: %v", err)
 		}
 	}
 
@@ -111,6 +111,7 @@ func pruneTxIndexTxs(db db.DB, pruneHeight int64) {
 
 	bat := db.NewBatch()
 	counter := 0
+	totalProcessed := 0
 
 	for ; itr.Valid(); itr.Next() {
 		key := itr.Key()
@@ -145,12 +146,18 @@ func pruneTxIndexTxs(db db.DB, pruneHeight int64) {
 		}
 
 		if counter >= 1000 {
-			fmt.Println("write batch", counter)
+			totalProcessed += counter
+			logger.BatchProgress("tx_index", counter, totalProcessed)
 			bat.WriteSync()
 			counter = 0
 			bat.Close()
 			bat = db.NewBatch()
 		}
+	}
+
+	if counter > 0 {
+		totalProcessed += counter
+		logger.BatchProgress("tx_index", counter, totalProcessed)
 	}
 
 	bat.WriteSync()
@@ -167,6 +174,7 @@ func pruneBlockIndex(db db.DB, pruneHeight int64) {
 
 	bat := db.NewBatch()
 	counter := 0
+	totalProcessed := 0
 
 	for ; itr.Valid(); itr.Next() {
 		key := itr.Key()
@@ -187,12 +195,18 @@ func pruneBlockIndex(db db.DB, pruneHeight int64) {
 		}
 
 		if counter >= 1000 {
-			fmt.Println("write batch", counter)
+			totalProcessed += counter
+			logger.BatchProgress("block_index", counter, totalProcessed)
 			bat.WriteSync()
 			counter = 0
 			bat.Close()
 			bat = db.NewBatch()
 		}
+	}
+
+	if counter > 0 {
+		totalProcessed += counter
+		logger.BatchProgress("block_index", counter, totalProcessed)
 	}
 
 	bat.WriteSync()
@@ -210,7 +224,7 @@ func pruneAppState(home string) error {
 	var err error
 
 	//TODO: need to get all versions in the store, setting randomly is too slow
-	fmt.Println("pruning application state")
+	logger.Info("pruning application state")
 
 	//// only mount keys from core sdk
 	//// todo allow for other keys to be mounted
@@ -222,7 +236,7 @@ func pruneAppState(home string) error {
 	//)
 
 	if app == "osmosis" {
-		fmt.Println("not support osmosis AppState, exit.")
+		logger.Warn("osmosis AppState not supported, skipping")
 		return nil
 	}
 
@@ -233,7 +247,7 @@ func pruneAppState(home string) error {
 
 	if txIdxHeight <= 0 {
 		txIdxHeight = appStore.LastCommitID().Version
-		fmt.Printf("[pruneAppState] set txIdxHeight=%d\n", txIdxHeight)
+		logger.Debug("set txIdxHeight=%d", txIdxHeight)
 	}
 
 	for _, value := range keys {
@@ -252,20 +266,20 @@ func pruneAppState(home string) error {
 		v64[i] = int64(allVersions[i])
 	}
 
-	fmt.Println(len(v64))
+	logger.Debug("total versions found: %d", len(v64))
 	versionsToPrune := int64(len(v64)) - int64(versions)
-	fmt.Printf("[pruneAppState] versionsToPrune=%d\n", versionsToPrune)
+	logger.Debug("versionsToPrune=%d", versionsToPrune)
 	if versionsToPrune <= 0 {
-		fmt.Printf("[pruneAppState] No need to prune (%d)\n", versionsToPrune)
+		logger.Info("No need to prune app state (versionsToPrune=%d)", versionsToPrune)
 	} else {
 		appStore.PruneHeights = v64[:versionsToPrune]
 		appStore.PruneStores()
 	}
 
 	if compact {
-		fmt.Println("compacting application state")
+		logger.Info("compacting application state")
 		if err := compactDB(appDB); err != nil {
-			fmt.Println(err.Error())
+			logger.Error("Failed to compact application state: %v", err)
 		}
 	}
 
@@ -296,18 +310,18 @@ func pruneTMData(home string) error {
 	base := blockStore.Base()
 
 	pruneHeight := blockStore.Height() - int64(blocks)
-	fmt.Printf("[pruneTMData] pruneHeight=%d\n", pruneHeight)
+	logger.Debug("pruneHeight=%d", pruneHeight)
 	if pruneHeight <= 0 {
-		fmt.Println("[pruneTMData] No need to prune")
+		logger.Info("No need to prune tendermint data")
 		return nil
 	}
 
 	if txIdxHeight <= 0 {
 		txIdxHeight = blockStore.Height()
-		fmt.Printf("[pruneTMData] set txIdxHeight=%d\n", txIdxHeight)
+		logger.Debug("set txIdxHeight=%d", txIdxHeight)
 	}
 
-	fmt.Println("pruning block store")
+	logger.Info("pruning block store")
 
 	// prune block store
 	// prune one by one instead of range to avoid `panic: pebble: batch too large: >= 4.0 G` issue
@@ -321,18 +335,18 @@ func pruneTMData(home string) error {
 		_, err = blockStore.PruneBlocks(height)
 		if err != nil {
 			//return err
-			fmt.Println(err.Error())
+			logger.Error("Failed to prune blocks at height %d: %v", height, err)
 		}
 	}
 
 	if compact {
-		fmt.Println("compacting block store")
+		logger.Info("compacting block store")
 		if err := compactDB(blockStoreDB); err != nil {
-			fmt.Println(err.Error())
+			logger.Error("Failed to compact block store: %v", err)
 		}
 	}
 
-	fmt.Println("pruning state store")
+	logger.Info("pruning state store")
 	// prune state store
 	// prune one by one instead of range to avoid `panic: pebble: batch too large: >= 4.0 G` issue
 	// (see https://github.com/notional-labs/cosmprund/issues/11)
@@ -344,14 +358,14 @@ func pruneTMData(home string) error {
 		err = stateStore.PruneStates(pruneStateFrom, endHeight)
 		if err != nil {
 			//return err
-			fmt.Println(err.Error())
+			logger.Error("Failed to prune states from %d to %d: %v", pruneStateFrom, endHeight, err)
 		}
 	}
 
 	if compact {
-		fmt.Println("compacting state store")
+		logger.Info("compacting state store")
 		if err := compactDB(stateDB); err != nil {
-			fmt.Println(err.Error())
+			logger.Error("Failed to compact state store: %v", err)
 		}
 	}
 
@@ -361,81 +375,25 @@ func pruneTMData(home string) error {
 // Utils
 
 func openDB(dbname string, home string) (db.DB, error) {
-	dbType := db.BackendType(backend)
 	dbDir := rootify(dataDir, home)
 
-	var db1 db.DB
-
-	if dbType == db.GoLevelDBBackend {
-		o := opt.Options{
-			DisableSeeksCompaction: true,
-		}
-
-		lvlDB, err := db.NewGoLevelDBWithOpts(dbname, dbDir, &o)
-		if err != nil {
-			return nil, err
-		}
-
-		db1 = lvlDB
-	} else if dbType == db.PebbleDBBackend {
-		opts := &pebble.Options{
-			MaxOpenFiles: 100,
-			//DisableAutomaticCompactions: true, // freeze when pruning!
-		}
-		opts.EnsureDefaults()
-
-		ppDB, err := db.NewPebbleDBWithOpts(dbname, dbDir, opts)
-		if err != nil {
-			return nil, err
-		}
-
-		db1 = ppDB
-	} else {
-		var err error
-		db1, err = db.NewDB(dbname, dbType, dbDir)
-		if err != nil {
-			return nil, err
-		}
+	// LevelDB with optimized options
+	o := opt.Options{
+		DisableSeeksCompaction: true,
 	}
 
-	return db1, nil
+	lvlDB, err := db.NewGoLevelDBWithOpts(dbname, dbDir, &o)
+	if err != nil {
+		return nil, err
+	}
+
+	return lvlDB, nil
 }
 
 func compactDB(vdb db.DB) error {
-	dbType := db.BackendType(backend)
-
-	if dbType == db.GoLevelDBBackend {
-		vdbLevel := vdb.(*db.GoLevelDB)
-
-		if err := vdbLevel.ForceCompact(nil, nil); err != nil {
-			return err
-		}
-	} else if dbType == db.PebbleDBBackend {
-		vdbPebble := vdb.(*db.PebbleDB).DB()
-
-		iter := vdbPebble.NewIter(nil)
-		//defer iter.Close()
-
-		var start, end []byte
-
-		if iter.First() {
-			start = cp(iter.Key())
-		}
-
-		if iter.Last() {
-			end = cp(iter.Key())
-		}
-
-		// close iter before compacting
-		iter.Close()
-
-		err := vdbPebble.Compact(start, end, false)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	// LevelDB compaction
+	vdbLevel := vdb.(*db.GoLevelDB)
+	return vdbLevel.ForceCompact(nil, nil)
 }
 
 func getStoreKeys(db db.DB) (storeKeys []string) {
