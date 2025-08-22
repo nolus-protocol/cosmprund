@@ -225,7 +225,20 @@ func pruneAppState(home string) error {
 
 	logger.Info("pruning application state")
 
-	keys := getStoreKeys(appDB)
+	// Check if database has any data
+	keys, err := getStoreKeysWithValidation(appDB)
+	if err != nil {
+		logger.Warn("Could not get store keys from database: %v", err)
+		logger.Info("Database might be empty or corrupted, skipping app state pruning")
+		return nil
+	}
+
+	if len(keys) == 0 {
+		logger.Info("No store keys found, skipping app state pruning")
+		return nil
+	}
+
+	logger.Debug("Found store keys: %v", keys)
 
 	// TODO: cleanup app state
 	appStore := rootmulti.NewStore(appDB)
@@ -241,7 +254,7 @@ func pruneAppState(home string) error {
 
 	err = appStore.LoadLatestVersion()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load latest version: %w", err)
 	}
 
 	allVersions := appStore.GetAllVersions()
@@ -379,17 +392,41 @@ func compactDB(vdb db.DB) error {
 	return vdbLevel.ForceCompact(nil, nil)
 }
 
-func getStoreKeys(db db.DB) (storeKeys []string) {
+// getStoreKeysWithValidation gets store keys with proper error handling
+func getStoreKeysWithValidation(db db.DB) ([]string, error) {
 	latestVer := rootmulti.GetLatestVersion(db)
-	latestCommitInfo, err := getCommitInfo(db, latestVer)
-	if err != nil {
-		panic(err)
+	if latestVer <= 0 {
+		return nil, fmt.Errorf("no latest version found (version=%d)", latestVer)
 	}
 
+	latestCommitInfo, err := getCommitInfo(db, latestVer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit info for version %d: %w", latestVer, err)
+	}
+
+	if latestCommitInfo == nil {
+		return nil, fmt.Errorf("commit info is nil for version %d", latestVer)
+	}
+
+	if len(latestCommitInfo.StoreInfos) == 0 {
+		return nil, fmt.Errorf("no store infos found in commit info for version %d", latestVer)
+	}
+
+	var storeKeys []string
 	for _, storeInfo := range latestCommitInfo.StoreInfos {
 		storeKeys = append(storeKeys, storeInfo.Name)
 	}
-	return
+
+	return storeKeys, nil
+}
+
+// getStoreKeys (legacy function for backward compatibility)
+func getStoreKeys(db db.DB) (storeKeys []string) {
+	keys, err := getStoreKeysWithValidation(db)
+	if err != nil {
+		panic(err)
+	}
+	return keys
 }
 
 func getCommitInfo(db db.DB, ver int64) (*storetypes.CommitInfo, error) {
