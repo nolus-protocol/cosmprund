@@ -249,17 +249,29 @@ func pruneAppState(home string) error {
 
 	err = appStore.LoadLatestVersion()
 	if err != nil {
-		return fmt.Errorf("failed to load latest version: %w", err)
-	}
-
-	// Use the application store's actual latest version for tx_index height
-	if txIdxHeight <= 0 {
-		txIdxHeight = appStore.LastCommitID().Version
-		logger.Debug("set txIdxHeight=%d from application store", txIdxHeight)
+		logger.Warn("Failed to load latest version: %v", err)
+		logger.Info("This usually indicates version mismatch between block store and app store")
+		logger.Info("App store may have been pruned more aggressively than block store")
+		logger.Info("Skipping application state pruning for safety")
+		return nil
 	}
 
 	appLatestVersion := appStore.LastCommitID().Version
 	logger.Debug("application store latest version: %d", appLatestVersion)
+
+	// Validate that we successfully loaded a reasonable version
+	if appLatestVersion <= 0 {
+		logger.Warn("Application store latest version is %d, skipping app state pruning", appLatestVersion)
+		return nil
+	}
+
+	// Set txIdxHeight from application store if not already set
+	if txIdxHeight <= 0 {
+		txIdxHeight = appLatestVersion
+		logger.Debug("set txIdxHeight=%d from application store", txIdxHeight)
+	} else {
+		logger.Debug("txIdxHeight already set to %d from block store, app store latest is %d", txIdxHeight, appLatestVersion)
+	}
 
 	allVersions := appStore.GetAllVersions()
 
@@ -352,20 +364,17 @@ func pruneTMData(home string) error {
 	// CONSERVATIVE STATE STORE PRUNING
 	logger.Info("pruning state store")
 
-	// Safety check: only prune if we have a very large safety buffer
-	statePruneHeight := currentHeight - int64(blocks) - 10000  // Extra 10k block safety buffer
+	// Use the same pruning height as block store - state should exist at this height
+	statePruneHeight := currentHeight - int64(blocks)
 	if statePruneHeight <= base {
-		logger.Info("Skipping state store pruning - insufficient safety buffer")
-		logger.Info("Need at least %d blocks beyond retention for safe state pruning", 10000)
-		logger.Info("Current height: %d, retention: %d blocks, base: %d", currentHeight, blocks, base)
+		logger.Info("No need to prune state store (statePruneHeight=%d, base=%d)", statePruneHeight, base)
 		return nil
 	}
 
-	logger.Info("State store pruning with safety buffer: pruning up to height %d", statePruneHeight)
-	logger.Info("Keeping %d blocks + 10k safety buffer beyond current height %d", blocks, currentHeight)
+	logger.Info("State store pruning up to height %d (keeping %d blocks)", statePruneHeight, blocks)
 
-	// Conservative pruning: smaller batches, larger safety margin
-	conservativeBatchSize := int64(100) // Much smaller batches
+	// Conservative approach: smaller batches and better error handling
+	conservativeBatchSize := int64(100) // Smaller batches for better error detection
 
 	for pruneStateFrom := base; pruneStateFrom < statePruneHeight; pruneStateFrom += conservativeBatchSize {
 		endHeight := pruneStateFrom + conservativeBatchSize
@@ -377,7 +386,8 @@ func pruneTMData(home string) error {
 		err = stateStore.PruneStates(pruneStateFrom, endHeight)
 		if err != nil {
 			logger.Error("Failed to prune states from %d to %d: %v", pruneStateFrom, endHeight, err)
-			logger.Warn("Stopping state store pruning due to error to prevent corruption")
+			logger.Warn("State store may have missing/corrupted data - stopping to prevent further issues")
+			logger.Info("This often indicates the database was already inconsistent before pruning")
 			break
 		}
 	}
