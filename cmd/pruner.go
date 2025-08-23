@@ -236,7 +236,16 @@ func pruneAppState(home string) error {
 
 	defer appDB.Close()
 
-	// Check if database has any data
+	// Quick method: try to get latest version and store keys directly
+	latestVer := rootmulti.GetLatestVersion(appDB)
+	if latestVer <= 0 {
+		logger.Info("No latest version found, skipping app state pruning")
+		return nil
+	}
+
+	logger.Debug("Found latest app version: %d", latestVer)
+
+	// Check if database has any data by getting store keys
 	keys, err := getStoreKeysWithValidation(appDB)
 	if err != nil {
 		logger.Warn("Could not get store keys from database: %v", err)
@@ -251,77 +260,156 @@ func pruneAppState(home string) error {
 
 	logger.Debug("Found store keys: %v", keys)
 
-	// DISCOVER what app state versions actually exist - get valid versions list
-	validVersions, err := discoverValidAppVersions(appDB)
-	if err != nil {
-		logger.Warn("Could not discover valid app versions: %v", err)
-		logger.Info("Skipping application state pruning - unable to determine available versions")
-		return nil
-	}
-
-	if len(validVersions) == 0 {
-		logger.Info("No valid versions found, skipping app state pruning")
-		return nil
-	}
-
-	minVersion := validVersions[0]
-	maxVersion := validVersions[len(validVersions)-1]
-
-	logger.Info("App state: found %d valid versions from %d to %d",
-		len(validVersions), minVersion, maxVersion)
-
-	// Set txIdxHeight from discovered app versions
+	// Set txIdxHeight from latest version
 	if txIdxHeight <= 0 {
-		txIdxHeight = maxVersion
-		logger.Debug("set txIdxHeight=%d from discovered app state versions", txIdxHeight)
+		txIdxHeight = latestVer
+		logger.Debug("set txIdxHeight=%d from latest app version", txIdxHeight)
 	}
 
-	// Check if we have enough versions to prune
-	if len(validVersions) <= versions {
-		logger.Info("App state has %d versions, retention is %d - no pruning needed",
-			len(validVersions), versions)
+	// Smart approach: use block-store guided range for app state
+	// Most app versions should align with block heights
+	if latestVer <= int64(versions) {
+		logger.Info("App state has latest version %d, retention is %d - no pruning needed", latestVer, versions)
 		return nil
 	}
 
-	// Calculate what to prune: keep last N versions of existing data
-	keepFromIndex := len(validVersions) - versions
-	versionsToKeep := validVersions[keepFromIndex:]
-	versionsToPrune := validVersions[:keepFromIndex]
+	// Calculate pruning range based on latest version
+	versionsToKeepFrom := latestVer - int64(versions) + 1
+	versionsToPruneUntil := versionsToKeepFrom - 1
 
-	if len(versionsToPrune) == 0 {
-		logger.Info("No versions to prune after calculations")
+	if versionsToPruneUntil <= 0 {
+		logger.Info("No app versions to prune (pruneUntil=%d)", versionsToPruneUntil)
 		return nil
 	}
 
-	logger.Info("App state: will prune %d versions (from %d to %d), keeping %d versions (from %d to %d)",
-		len(versionsToPrune), versionsToPrune[0], versionsToPrune[len(versionsToPrune)-1],
-		len(versionsToKeep), versionsToKeep[0], versionsToKeep[len(versionsToKeep)-1])
+	logger.Info("App state: will attempt to prune versions 1 to %d, keeping %d to %d",
+		versionsToPruneUntil, versionsToKeepFrom, latestVer)
 
-	// Mount stores and prune using discovered versions
+	// Quick sampling to see if we have data in the range
+	sampleVersions := []int64{1, versionsToPruneUntil / 2, versionsToPruneUntil, versionsToKeepFrom, latestVer}
+	validSamples := 0
+
+	for _, ver := range sampleVersions {
+		if ver > 0 && hasCommitInfoAtVersion(appDB, ver) {
+			validSamples++
+		}
+	}
+
+	logger.Debug("Found commit info at %d/%d sample versions", validSamples, len(sampleVersions))
+
+	// Build pruning list in chunks to avoid memory issues
+	var prunedVersions []int64
+	chunkSize := int64(10000) // Process 10k versions at a time
+
+	for chunkStart := int64(1); chunkStart <= versionsToPruneUntil; chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize - 1
+		if chunkEnd > versionsToPruneUntil {
+			chunkEnd = versionsToPruneUntil
+		}
+
+		// Add this chunk to pruning list
+		for v := chunkStart; v <= chunkEnd; v++ {
+			prunedVersions = append(prunedVersions, v)
+		}
+
+		// Progress update for large ranges
+		if chunkEnd%100000 == 0 || chunkEnd >= versionsToPruneUntil {
+			logger.Debug("Prepared app versions for pruning: 1 to %d", chunkEnd)
+		}
+	}
+
+	if len(prunedVersions) == 0 {
+		logger.Info("No versions to prune")
+		return nil
+	}
+
+	// Mount stores and prune using version range
 	appStore := rootmulti.NewStore(appDB)
 	for _, key := range keys {
 		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(key), sdk.StoreTypeIAVL, nil)
 	}
 
-	// Load latest valid version that actually exists
-	err = appStore.LoadVersion(maxVersion)
-	if err != nil {
-		logger.Warn("Failed to load version %d: %v", maxVersion, err)
-		logger.Info("Falling back to LoadLatestVersion")
-		err = appStore.LoadLatestVersion()
-		if err != nil {
-			return fmt.Errorf("failed to load any version: %w", err)
+	// Try to load a working version - start from latest and work backwards
+	var workingVersion int64
+	loadSuccess := false
+
+	// Try the latest version first
+	err = appStore.LoadVersion(latestVer)
+	if err == nil {
+		workingVersion = latestVer
+		loadSuccess = true
+		logger.Debug("Successfully loaded latest version %d", latestVer)
+	} else {
+		logger.Warn("Failed to load latest version %d: %v", latestVer, err)
+
+		// Try a few versions before the latest
+		for i := int64(1); i <= 10 && !loadSuccess; i++ {
+			tryVersion := latestVer - i
+			if tryVersion > 0 {
+				logger.Debug("Trying to load version %d", tryVersion)
+				loadErr := appStore.LoadVersion(tryVersion)
+				if loadErr == nil {
+					workingVersion = tryVersion
+					loadSuccess = true
+					logger.Info("Successfully loaded version %d (latest %d failed)", tryVersion, latestVer)
+					break
+				}
+			}
 		}
 	}
 
-	logger.Info("Pruning %d valid versions from app state", len(versionsToPrune))
-	appStore.PruneHeights = versionsToPrune
+	// Final fallback to LoadLatestVersion
+	if !loadSuccess {
+		logger.Info("All specific versions failed, trying LoadLatestVersion")
+		err = appStore.LoadLatestVersion()
+		if err != nil {
+			return fmt.Errorf("failed to load any version including LoadLatestVersion: %w", err)
+		}
+		workingVersion = appStore.LastCommitID().Version
+		logger.Info("LoadLatestVersion succeeded with version %d", workingVersion)
+	}
+
+	// Adjust pruning range based on working version if needed
+	if workingVersion < latestVer {
+		// Recalculate pruning range based on working version
+		if workingVersion <= int64(versions) {
+			logger.Info("Working version %d is too low for pruning (retention: %d)", workingVersion, versions)
+			return nil
+		}
+
+		newVersionsToKeepFrom := workingVersion - int64(versions) + 1
+		newVersionsToPruneUntil := newVersionsToKeepFrom - 1
+
+		if newVersionsToPruneUntil <= 0 {
+			logger.Info("No versions to prune after adjustment (pruneUntil=%d)", newVersionsToPruneUntil)
+			return nil
+		}
+
+		// Rebuild pruning list with adjusted range
+		prunedVersions = prunedVersions[:0] // Clear the slice
+		for chunkStart := int64(1); chunkStart <= newVersionsToPruneUntil; chunkStart += chunkSize {
+			chunkEnd := chunkStart + chunkSize - 1
+			if chunkEnd > newVersionsToPruneUntil {
+				chunkEnd = newVersionsToPruneUntil
+			}
+
+			for v := chunkStart; v <= chunkEnd; v++ {
+				prunedVersions = append(prunedVersions, v)
+			}
+		}
+
+		logger.Info("Adjusted pruning based on working version %d: will prune %d versions up to %d",
+			workingVersion, len(prunedVersions), newVersionsToPruneUntil)
+	}
+
+	logger.Info("Pruning %d versions from app state (this may take time for large ranges)", len(prunedVersions))
+	appStore.PruneHeights = prunedVersions
 	appStore.PruneStores()
 
 	if compact {
 		logger.Info("compacting application state")
-		if err := compactDB(appDB); err != nil {
-			logger.Error("Failed to compact application state: %v", err)
+		if compactErr := compactDB(appDB); compactErr != nil {
+			logger.Error("Failed to compact application state: %v", compactErr)
 		}
 	}
 
@@ -523,6 +611,15 @@ func discoverValidAppVersions(appDB db.DB) ([]int64, error) {
 	}
 
 	return versions, nil
+}
+
+// hasCommitInfoAtVersion checks if commit info exists at a specific version (quick check)
+func hasCommitInfoAtVersion(appDB db.DB, version int64) bool {
+	const commitInfoKeyFmt = "s/%d" // s/<version>
+	cInfoKey := fmt.Sprintf(commitInfoKeyFmt, version)
+
+	val, err := appDB.Get([]byte(cInfoKey))
+	return err == nil && val != nil
 }
 
 // hasStateDataAtHeight checks if state data exists at a specific height (quick check)
