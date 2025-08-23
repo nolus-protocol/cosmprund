@@ -22,9 +22,22 @@ import (
 // to figuring out the height to prune tx_index
 var txIdxHeight int64 = 0
 
-// load db
-// load app store and prune
-// if immutable tree is not deletable we should import and export current state
+// DataRange represents a range of available data
+type DataRange struct {
+	Min int64
+	Max int64
+}
+
+func (dr *DataRange) IsValid() bool {
+	return dr.Min > 0 && dr.Max > 0 && dr.Max >= dr.Min
+}
+
+func (dr *DataRange) Size() int64 {
+	if !dr.IsValid() {
+		return 0
+	}
+	return dr.Max - dr.Min + 1
+}
 
 func pruneCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -214,16 +227,14 @@ func pruneBlockIndex(db db.DB, pruneHeight int64) {
 }
 
 func pruneAppState(home string) error {
+	logger.Info("pruning application state")
+
 	appDB, errDB := openDB("application", home)
 	if errDB != nil {
 		return errDB
 	}
 
 	defer appDB.Close()
-
-	var err error
-
-	logger.Info("pruning application state")
 
 	// Check if database has any data
 	keys, err := getStoreKeysWithValidation(appDB)
@@ -240,56 +251,78 @@ func pruneAppState(home string) error {
 
 	logger.Debug("Found store keys: %v", keys)
 
-	// TODO: cleanup app state
-	appStore := rootmulti.NewStore(appDB)
-
-	for _, value := range keys {
-		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(value), sdk.StoreTypeIAVL, nil)
-	}
-
-	err = appStore.LoadLatestVersion()
+	// DISCOVER what app state versions actually exist
+	versionRange, err := discoverAppVersionRange(appDB)
 	if err != nil {
-		logger.Warn("Failed to load latest version: %v", err)
-		logger.Info("This usually indicates version mismatch between block store and app store")
-		logger.Info("App store may have been pruned more aggressively than block store")
-		logger.Info("Skipping application state pruning for safety")
+		logger.Warn("Could not discover app version range: %v", err)
+		logger.Info("Skipping application state pruning - unable to determine available versions")
 		return nil
 	}
 
-	appLatestVersion := appStore.LastCommitID().Version
-	logger.Debug("application store latest version: %d", appLatestVersion)
-
-	// Validate that we successfully loaded a reasonable version
-	if appLatestVersion <= 0 {
-		logger.Warn("Application store latest version is %d, skipping app state pruning", appLatestVersion)
+	if !versionRange.IsValid() {
+		logger.Info("No valid version range found, skipping app state pruning")
 		return nil
 	}
 
-	// Set txIdxHeight from application store if not already set
+	logger.Info("App state: available versions from %d to %d (%d versions)",
+		versionRange.Min, versionRange.Max, versionRange.Size())
+
+	// Set txIdxHeight from discovered app versions
 	if txIdxHeight <= 0 {
-		txIdxHeight = appLatestVersion
-		logger.Debug("set txIdxHeight=%d from application store", txIdxHeight)
-	} else {
-		logger.Debug("txIdxHeight already set to %d from block store, app store latest is %d", txIdxHeight, appLatestVersion)
+		txIdxHeight = versionRange.Max
+		logger.Debug("set txIdxHeight=%d from discovered app state versions", txIdxHeight)
 	}
 
-	allVersions := appStore.GetAllVersions()
-
-	v64 := make([]int64, len(allVersions))
-	for i := 0; i < len(allVersions); i++ {
-		v64[i] = int64(allVersions[i])
+	// Check if we have enough versions to prune
+	if versionRange.Size() <= int64(versions) {
+		logger.Info("App state has %d versions, retention is %d - no pruning needed",
+			versionRange.Size(), versions)
+		return nil
 	}
 
-	logger.Debug("total versions found: %d", len(v64))
-	versionsToPrune := int64(len(v64)) - int64(versions)
-	logger.Debug("versionsToPrune=%d", versionsToPrune)
-	if versionsToPrune <= 0 {
-		logger.Info("No need to prune app state (versionsToPrune=%d)", versionsToPrune)
-	} else {
-		logger.Info("Pruning %d versions from app state, keeping latest %d versions", versionsToPrune, versions)
-		appStore.PruneHeights = v64[:versionsToPrune]
-		appStore.PruneStores()
+	// Calculate what to prune: keep last N versions of existing data
+	versionsToKeepFrom := versionRange.Max - int64(versions) + 1
+	versionsToPruneUntil := versionsToKeepFrom - 1
+
+	if versionsToPruneUntil < versionRange.Min {
+		logger.Info("App state already pruned sufficiently")
+		return nil
 	}
+
+	logger.Info("App state: will prune versions %d to %d, keeping %d to %d",
+		versionRange.Min, versionsToPruneUntil, versionsToKeepFrom, versionRange.Max)
+
+	// Create pruning list based on discovered range
+	var prunedVersions []int64
+	for v := versionRange.Min; v <= versionsToPruneUntil; v++ {
+		prunedVersions = append(prunedVersions, v)
+	}
+
+	if len(prunedVersions) == 0 {
+		logger.Info("No versions to prune")
+		return nil
+	}
+
+	// Mount stores and prune using discovered versions
+	appStore := rootmulti.NewStore(appDB)
+	for _, key := range keys {
+		appStore.MountStoreWithDB(storetypes.NewKVStoreKey(key), sdk.StoreTypeIAVL, nil)
+	}
+
+	// Load latest version that actually exists
+	err = appStore.LoadVersion(versionRange.Max)
+	if err != nil {
+		logger.Warn("Failed to load version %d: %v", versionRange.Max, err)
+		logger.Info("Falling back to LoadLatestVersion")
+		err = appStore.LoadLatestVersion()
+		if err != nil {
+			return fmt.Errorf("failed to load any version: %w", err)
+		}
+	}
+
+	logger.Info("Pruning %d versions from app state", len(prunedVersions))
+	appStore.PruneHeights = prunedVersions
+	appStore.PruneStores()
 
 	if compact {
 		logger.Info("compacting application state")
@@ -301,7 +334,7 @@ func pruneAppState(home string) error {
 	return nil
 }
 
-// pruneTMData prunes the tendermint blocks and state based on the amount of blocks to keep
+// pruneTMData prunes the tendermint blocks and state based on available data
 func pruneTMData(home string) error {
 	blockStoreDB, errDBBlock := openDB("blockstore", home)
 	if errDBBlock != nil {
@@ -317,42 +350,45 @@ func pruneTMData(home string) error {
 		return errDBBState
 	}
 
-	var err error
-
 	stateStore := state.NewStore(stateDB)
 	defer stateStore.Close()
 
-	base := blockStore.Base()
 	currentHeight := blockStore.Height()
+	base := blockStore.Base()
 
-	pruneHeight := currentHeight - int64(blocks)
-	logger.Debug("pruneHeight=%d, currentHeight=%d", pruneHeight, currentHeight)
+	logger.Debug("Block store: base=%d, current=%d", base, currentHeight)
 
-	if pruneHeight <= 0 {
-		logger.Info("No need to prune tendermint data")
+	if currentHeight <= int64(blocks) {
+		logger.Info("Not enough blocks for pruning (current: %d, retention: %d)", currentHeight, blocks)
 		return nil
 	}
 
 	if txIdxHeight <= 0 {
 		txIdxHeight = currentHeight
-		logger.Debug("set txIdxHeight=%d", txIdxHeight)
+		logger.Debug("set txIdxHeight=%d from block store", txIdxHeight)
 	}
 
+	// BLOCK STORE PRUNING (already data-aware)
 	logger.Info("pruning block store")
 
-	// prune block store
-	// prune in batches to avoid memory issues and maintain performance with LevelDB
-	for pruneBlockFrom := base; pruneBlockFrom < pruneHeight-1; pruneBlockFrom += rootmulti.PRUNE_BATCH_SIZE {
-		height := pruneBlockFrom
-		if height >= pruneHeight-1 {
-			height = pruneHeight - 1
-		}
+	blockPruneHeight := currentHeight - int64(blocks)
+	logger.Info("Block store: will prune blocks up to height %d, keeping %d to %d",
+		blockPruneHeight, blockPruneHeight+1, currentHeight)
 
-		_, err = blockStore.PruneBlocks(height)
-		if err != nil {
-			//return err
-			logger.Error("Failed to prune blocks at height %d: %v", height, err)
+	if blockPruneHeight > base {
+		for pruneFrom := base; pruneFrom < blockPruneHeight; pruneFrom += rootmulti.PRUNE_BATCH_SIZE {
+			height := pruneFrom + rootmulti.PRUNE_BATCH_SIZE - 1
+			if height > blockPruneHeight {
+				height = blockPruneHeight
+			}
+
+			_, err := blockStore.PruneBlocks(height)
+			if err != nil {
+				logger.Error("Failed to prune blocks at height %d: %v", height, err)
+			}
 		}
+	} else {
+		logger.Info("Block store already pruned sufficiently")
 	}
 
 	if compact {
@@ -362,36 +398,57 @@ func pruneTMData(home string) error {
 		}
 	}
 
-	// DISABLE STATE STORE PRUNING FOR NOW
-	logger.Info("skipping state store pruning")
-	logger.Info("State store pruning disabled due to inconsistent data issues with snapshot-restored nodes")
-	logger.Info("This is normal for nodes restored from snapshots or previously pruned nodes")
-	logger.Info("Block store and application state pruning will provide significant space savings")
-
-	// DISABLED: State store pruning until we implement smart data discovery
-	/*
+	// SMART STATE STORE PRUNING
 	logger.Info("pruning state store")
-	statePruneHeight := currentHeight - int64(blocks)
-	if statePruneHeight <= base {
-		logger.Info("No need to prune state store (statePruneHeight=%d, base=%d)", statePruneHeight, base)
+
+	// Discover what state data actually exists
+	stateRange, err := discoverStateRange(stateDB)
+	if err != nil {
+		logger.Warn("Could not discover state data range: %v", err)
+		logger.Info("Skipping state store pruning - unable to determine available data")
 		return nil
 	}
 
-	logger.Info("State store pruning up to height %d (keeping %d blocks)", statePruneHeight, blocks)
-	conservativeBatchSize := int64(100)
+	if !stateRange.IsValid() {
+		logger.Info("No valid state data found, skipping state store pruning")
+		return nil
+	}
 
-	for pruneStateFrom := base; pruneStateFrom < statePruneHeight; pruneStateFrom += conservativeBatchSize {
-		endHeight := pruneStateFrom + conservativeBatchSize
-		if endHeight > statePruneHeight {
-			endHeight = statePruneHeight
+	logger.Info("State store: available data from height %d to %d (%d heights)",
+		stateRange.Min, stateRange.Max, stateRange.Size())
+
+	// Check if we have enough state data to prune
+	if stateRange.Size() <= int64(blocks) {
+		logger.Info("State store has %d heights, retention is %d - no pruning needed",
+			stateRange.Size(), blocks)
+		return nil
+	}
+
+	// Calculate what to prune: keep last N blocks of existing state data
+	stateKeepFrom := stateRange.Max - int64(blocks) + 1
+	statePruneUntil := stateKeepFrom - 1
+
+	if statePruneUntil < stateRange.Min {
+		logger.Info("State store already pruned sufficiently")
+		return nil
+	}
+
+	logger.Info("State store: will prune heights %d to %d, keeping %d to %d",
+		stateRange.Min, statePruneUntil, stateKeepFrom, stateRange.Max)
+
+	// Prune in small batches within the discovered range
+	batchSize := int64(100)
+	for pruneFrom := stateRange.Min; pruneFrom <= statePruneUntil; pruneFrom += batchSize {
+		pruneUntil := pruneFrom + batchSize - 1
+		if pruneUntil > statePruneUntil {
+			pruneUntil = statePruneUntil
 		}
 
-		logger.Debug("Pruning state from %d to %d", pruneStateFrom, endHeight)
-		err = stateStore.PruneStates(pruneStateFrom, endHeight)
+		logger.Debug("Pruning state from %d to %d", pruneFrom, pruneUntil)
+		err = stateStore.PruneStates(pruneFrom, pruneUntil)
 		if err != nil {
-			logger.Error("Failed to prune states from %d to %d: %v", pruneStateFrom, endHeight, err)
-			logger.Warn("State store may have missing/corrupted data - stopping to prevent further issues")
-			logger.Info("This often indicates the database was already inconsistent before pruning")
+			logger.Error("Failed to prune states from %d to %d: %v", pruneFrom, pruneUntil, err)
+			logger.Warn("Stopping state pruning - data may be inconsistent in this range")
 			break
 		}
 	}
@@ -402,9 +459,119 @@ func pruneTMData(home string) error {
 			logger.Error("Failed to compact state store: %v", err)
 		}
 	}
-	*/
 
 	return nil
+}
+
+// discoverAppVersionRange finds what app state versions actually exist
+func discoverAppVersionRange(appDB db.DB) (*DataRange, error) {
+	latestVer := rootmulti.GetLatestVersion(appDB)
+	if latestVer <= 0 {
+		return nil, fmt.Errorf("no latest version found (version=%d)", latestVer)
+	}
+
+	// For now, we'll use a simple approach: assume continuous versions exist from some minimum to latest
+	// In a more sophisticated implementation, we could scan the database to find actual version gaps
+
+	// Try to find the earliest version by looking for commit info keys
+	itr, err := appDB.Iterator(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create iterator: %w", err)
+	}
+	defer itr.Close()
+
+	var minVersion int64 = latestVer // Start with latest and find minimum
+	commitInfoPrefix := "s/"
+
+	for ; itr.Valid(); itr.Next() {
+		key := string(itr.Key())
+
+		// Look for commit info keys (format: s/<version>)
+		if strings.HasPrefix(key, commitInfoPrefix) && key != "s/latest" && key != "s/pruneheights" {
+			versionStr := strings.TrimPrefix(key, commitInfoPrefix)
+			if version, err := strconv.ParseInt(versionStr, 10, 64); err == nil {
+				if version < minVersion {
+					minVersion = version
+				}
+			}
+		}
+	}
+
+	// Validate we found a reasonable range
+	if minVersion > latestVer {
+		return nil, fmt.Errorf("invalid version range: min=%d, max=%d", minVersion, latestVer)
+	}
+
+	return &DataRange{Min: minVersion, Max: latestVer}, nil
+}
+
+// discoverStateRange finds what state data actually exists
+func discoverStateRange(stateDB db.DB) (*DataRange, error) {
+	itr, err := stateDB.Iterator(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create iterator: %w", err)
+	}
+	defer itr.Close()
+
+	var minHeight, maxHeight int64 = -1, -1
+
+	// Look for state keys that contain height information
+	for ; itr.Valid(); itr.Next() {
+		key := string(itr.Key())
+
+		// Look for various state keys that contain height information
+		var height int64
+		found := false
+
+		// Check for validator keys (format: validatorsKey:<height>)
+		if strings.Contains(key, "validatorsKey:") {
+			parts := strings.Split(key, ":")
+			if len(parts) >= 2 {
+				if h, err := strconv.ParseInt(parts[len(parts)-1], 10, 64); err == nil {
+					height = h
+					found = true
+				}
+			}
+		}
+
+		// Check for consensus state keys (format: consensusState:<height>)
+		if !found && strings.Contains(key, "consensusState:") {
+			parts := strings.Split(key, ":")
+			if len(parts) >= 2 {
+				if h, err := strconv.ParseInt(parts[len(parts)-1], 10, 64); err == nil {
+					height = h
+					found = true
+				}
+			}
+		}
+
+		// Check for other height-based keys
+		if !found && strings.Contains(key, "Height:") {
+			parts := strings.Split(key, ":")
+			for _, part := range parts {
+				if h, err := strconv.ParseInt(part, 10, 64); err == nil && h > 0 {
+					height = h
+					found = true
+					break
+				}
+			}
+		}
+
+		if found {
+			if minHeight == -1 || height < minHeight {
+				minHeight = height
+			}
+			if maxHeight == -1 || height > maxHeight {
+				maxHeight = height
+			}
+		}
+	}
+
+	if minHeight == -1 || maxHeight == -1 {
+		return nil, fmt.Errorf("no state data with height information found")
+	}
+
+	return &DataRange{Min: minHeight, Max: maxHeight}, nil
 }
 
 // Utils
