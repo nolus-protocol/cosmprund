@@ -286,6 +286,7 @@ func pruneAppState(home string) error {
 	if versionsToPrune <= 0 {
 		logger.Info("No need to prune app state (versionsToPrune=%d)", versionsToPrune)
 	} else {
+		logger.Info("Pruning %d versions from app state, keeping latest %d versions", versionsToPrune, versions)
 		appStore.PruneHeights = v64[:versionsToPrune]
 		appStore.PruneStores()
 	}
@@ -361,10 +362,15 @@ func pruneTMData(home string) error {
 		}
 	}
 
-	// CONSERVATIVE STATE STORE PRUNING
-	logger.Info("pruning state store")
+	// DISABLE STATE STORE PRUNING FOR NOW
+	logger.Info("skipping state store pruning")
+	logger.Info("State store pruning disabled due to inconsistent data issues with snapshot-restored nodes")
+	logger.Info("This is normal for nodes restored from snapshots or previously pruned nodes")
+	logger.Info("Block store and application state pruning will provide significant space savings")
 
-	// Use the same pruning height as block store - state should exist at this height
+	// DISABLED: State store pruning until we implement smart data discovery
+	/*
+	logger.Info("pruning state store")
 	statePruneHeight := currentHeight - int64(blocks)
 	if statePruneHeight <= base {
 		logger.Info("No need to prune state store (statePruneHeight=%d, base=%d)", statePruneHeight, base)
@@ -372,9 +378,7 @@ func pruneTMData(home string) error {
 	}
 
 	logger.Info("State store pruning up to height %d (keeping %d blocks)", statePruneHeight, blocks)
-
-	// Conservative approach: smaller batches and better error handling
-	conservativeBatchSize := int64(100) // Smaller batches for better error detection
+	conservativeBatchSize := int64(100)
 
 	for pruneStateFrom := base; pruneStateFrom < statePruneHeight; pruneStateFrom += conservativeBatchSize {
 		endHeight := pruneStateFrom + conservativeBatchSize
@@ -398,6 +402,7 @@ func pruneTMData(home string) error {
 			logger.Error("Failed to compact state store: %v", err)
 		}
 	}
+	*/
 
 	return nil
 }
