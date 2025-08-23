@@ -392,90 +392,75 @@ func pruneTMData(home string) error {
 		}
 	}
 
-	// ROBUST STATE STORE PRUNING
+	// SMART STATE STORE PRUNING - Use block store info to guide state pruning
 	logger.Info("pruning state store")
 
-	// Discover what state data actually exists - get valid heights list
-	validHeights, err := discoverValidStateHeights(stateDB)
-	if err != nil {
-		logger.Warn("Could not discover valid state heights: %v", err)
-		logger.Info("Skipping state store pruning - unable to determine available heights")
+	// Use block store info to determine state pruning range
+	// Most state data should align with block heights
+	statePruneHeight := currentHeight - int64(blocks)
+
+	logger.Info("State store: will attempt to prune states up to height %d based on block store info", statePruneHeight)
+
+	// Quick validation: check if state data exists at key heights
+	sampleHeights := []int64{base, base + 1000, statePruneHeight - 1000, statePruneHeight, currentHeight - 100, currentHeight}
+	validSamples := 0
+
+	for _, height := range sampleHeights {
+		if height > 0 && hasStateDataAtHeight(stateDB, height) {
+			validSamples++
+		}
+	}
+
+	if validSamples == 0 {
+		logger.Info("No state data found at sample heights, skipping state store pruning")
 		return nil
 	}
 
-	if len(validHeights) == 0 {
-		logger.Info("No valid state heights found, skipping state store pruning")
-		return nil
-	}
+	logger.Debug("Found state data at %d/%d sample heights, proceeding with pruning", validSamples, len(sampleHeights))
 
-	minHeight := validHeights[0]
-	maxHeight := validHeights[len(validHeights)-1]
-
-	logger.Info("State store: found %d valid heights from %d to %d",
-		len(validHeights), minHeight, maxHeight)
-
-	// Check if we have enough state data to prune
-	if len(validHeights) <= blocks {
-		logger.Info("State store has %d heights, retention is %d - no pruning needed",
-			len(validHeights), blocks)
-		return nil
-	}
-
-	// Calculate what to prune: keep last N blocks of existing state data
-	keepFromIndex := len(validHeights) - blocks
-	heightsToKeep := validHeights[keepFromIndex:]
-	heightsToPrune := validHeights[:keepFromIndex]
-
-	if len(heightsToPrune) == 0 {
-		logger.Info("No heights to prune after calculations")
-		return nil
-	}
-
-	logger.Info("State store: will prune %d heights (from %d to %d), keeping %d heights (from %d to %d)",
-		len(heightsToPrune), heightsToPrune[0], heightsToPrune[len(heightsToPrune)-1],
-		len(heightsToKeep), heightsToKeep[0], heightsToKeep[len(heightsToKeep)-1])
-
-	// Prune in small batches within the valid heights only
-	batchSize := int64(100)
+	// Prune state in chunks, handling gaps gracefully
+	chunkSize := int64(1000) // Process 1000 heights at a time
 	totalPruned := 0
+	totalErrors := 0
 
-	for i := 0; i < len(heightsToPrune); i += int(batchSize) {
-		endIdx := i + int(batchSize)
-		if endIdx > len(heightsToPrune) {
-			endIdx = len(heightsToPrune)
+	for chunkStart := base; chunkStart < statePruneHeight; chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize - 1
+		if chunkEnd > statePruneHeight {
+			chunkEnd = statePruneHeight
 		}
 
-		batchHeights := heightsToPrune[i:endIdx]
-		if len(batchHeights) == 0 {
-			continue
+		logger.Debug("Processing state chunk: %d to %d", chunkStart, chunkEnd)
+
+		// Try to prune this chunk
+		chunkErr := stateStore.PruneStates(chunkStart, chunkEnd)
+		if chunkErr != nil {
+			totalErrors++
+			logger.Debug("State chunk %d-%d had errors (expected for sparse data): %v", chunkStart, chunkEnd, chunkErr)
+
+			// If too many errors, the range might be mostly empty
+			if totalErrors > 10 && totalPruned < 100 {
+				logger.Info("Too many state pruning errors with little progress - likely sparse data, stopping state pruning")
+				break
+			}
+		} else {
+			totalPruned += int(chunkEnd - chunkStart + 1)
 		}
 
-		minBatch := batchHeights[0]
-		maxBatch := batchHeights[len(batchHeights)-1]
-
-		logger.Debug("Pruning state batch from %d to %d (%d heights)", minBatch, maxBatch, len(batchHeights))
-
-		err = stateStore.PruneStates(minBatch, maxBatch)
-		if err != nil {
-			logger.Error("Failed to prune state batch from %d to %d: %v", minBatch, maxBatch, err)
-			// Continue with next batch rather than stopping entirely
-			continue
-		}
-
-		totalPruned += len(batchHeights)
-
-		// Progress logging
-		if totalPruned%1000 == 0 || i+int(batchSize) >= len(heightsToPrune) {
-			logger.Progress("State pruning progress: %d/%d heights processed", totalPruned, len(heightsToPrune))
+		// Progress update every 10k heights
+		if (chunkStart-base)%10000 == 0 || chunkEnd >= statePruneHeight {
+			processed := chunkEnd - base + 1
+			total := statePruneHeight - base + 1
+			logger.Progress("State pruning: processed %d/%d heights (errors: %d)", processed, total, totalErrors)
 		}
 	}
 
-	logger.Info("State pruning completed: %d heights processed", totalPruned)
+	logger.Info("State pruning completed: %d total heights processed, %d errors (errors are normal for sparse data)",
+		totalPruned, totalErrors)
 
 	if compact {
 		logger.Info("compacting state store")
-		if err := compactDB(stateDB); err != nil {
-			logger.Error("Failed to compact state store: %v", err)
+		if compactErr := compactDB(stateDB); compactErr != nil {
+			logger.Error("Failed to compact state store: %v", compactErr)
 		}
 	}
 
@@ -492,18 +477,26 @@ func discoverValidAppVersions(appDB db.DB) ([]int64, error) {
 
 	versionSet := make(map[int64]bool)
 	commitInfoPrefix := "s/"
+	processed := 0
+
+	logger.Debug("Scanning for valid app versions...")
 
 	for ; itr.Valid(); itr.Next() {
 		key := string(itr.Key())
+		processed++
+
+		// Progress logging every 10k keys
+		if processed%10000 == 0 {
+			logger.Debug("App version discovery: processed %d keys", processed)
+		}
 
 		// Look for commit info keys (format: s/<version>)
 		if strings.HasPrefix(key, commitInfoPrefix) && key != "s/latest" && key != "s/pruneheights" {
 			versionStr := strings.TrimPrefix(key, commitInfoPrefix)
 			if version, parseErr := strconv.ParseInt(versionStr, 10, 64); parseErr == nil && version > 0 {
-				// Validate this version is actually accessible by trying to load commit info
-				if _, checkErr := getCommitInfo(appDB, version); checkErr == nil {
-					versionSet[version] = true
-				}
+				// For performance, assume commit info keys are valid without re-checking
+				// (we'll validate when actually loading)
+				versionSet[version] = true
 			}
 		}
 	}
@@ -511,6 +504,8 @@ func discoverValidAppVersions(appDB db.DB) ([]int64, error) {
 	if len(versionSet) == 0 {
 		return nil, fmt.Errorf("no accessible commit info versions found")
 	}
+
+	logger.Debug("Found %d potential app versions", len(versionSet))
 
 	// Convert to sorted slice
 	var versions []int64
@@ -528,6 +523,26 @@ func discoverValidAppVersions(appDB db.DB) ([]int64, error) {
 	}
 
 	return versions, nil
+}
+
+// hasStateDataAtHeight checks if state data exists at a specific height (quick check)
+func hasStateDataAtHeight(stateDB db.DB, height int64) bool {
+	// Check for common state keys at this height
+	heightStr := strconv.FormatInt(height, 10)
+
+	// Try validator key format
+	validatorKey := "validatorsKey:" + heightStr
+	if val, err := stateDB.Get([]byte(validatorKey)); err == nil && val != nil {
+		return true
+	}
+
+	// Try consensus state key format
+	consensusKey := "consensusState:" + heightStr
+	if val, err := stateDB.Get([]byte(consensusKey)); err == nil && val != nil {
+		return true
+	}
+
+	return false
 }
 
 // discoverValidStateHeights finds all actually accessible state heights
@@ -635,6 +650,22 @@ func compactDB(vdb db.DB) error {
 
 // getStoreKeysWithValidation gets store keys with proper error handling
 func getStoreKeysWithValidation(db db.DB) ([]string, error) {
+	// Try to get latest version first (fastest method)
+	latestVer := rootmulti.GetLatestVersion(db)
+	if latestVer > 0 {
+		if latestCommitInfo, err := getCommitInfo(db, latestVer); err == nil && latestCommitInfo != nil {
+			if len(latestCommitInfo.StoreInfos) > 0 {
+				var storeKeys []string
+				for _, storeInfo := range latestCommitInfo.StoreInfos {
+					storeKeys = append(storeKeys, storeInfo.Name)
+				}
+				return storeKeys, nil
+			}
+		}
+	}
+
+	// Fallback: find any valid version
+	logger.Debug("Latest version failed, scanning for any valid version...")
 	validVersions, err := discoverValidAppVersions(db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover valid versions: %w", err)
@@ -645,7 +676,7 @@ func getStoreKeysWithValidation(db db.DB) ([]string, error) {
 	}
 
 	// Use the latest valid version to get store keys
-	latestVer := validVersions[len(validVersions)-1]
+	latestVer = validVersions[len(validVersions)-1]
 
 	latestCommitInfo, err := getCommitInfo(db, latestVer)
 	if err != nil {
