@@ -121,7 +121,7 @@ func init() {
 	// Flags
 	rootCmd.PersistentFlags().StringVar(&dataDir, "data-dir", "data", "path to data directory")
 	rootCmd.PersistentFlags().BoolVar(&tendermint, "tendermint", true, "prune tendermint data")
-	rootCmd.PersistentFlags().BoolVar(&cosmosSdk, "cosmos-sdk", true, "prune cosmos-sdk data")
+	rootCmd.PersistentFlags().BoolVar(&cosmosSdk, "cosmos-sdk", false, "prune cosmos-sdk data (DISABLED BY DEFAULT for safety)")
 	rootCmd.PersistentFlags().BoolVar(&tx_idx, "tx_index", true, "prune tx_index")
 	rootCmd.PersistentFlags().BoolVar(&compact, "compact", true, "compact dbs after pruning")
 	rootCmd.PersistentFlags().IntVar(&versions, "versions", 10, "amount of versions to keep")
